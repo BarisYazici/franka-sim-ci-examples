@@ -1,0 +1,151 @@
+name: franka_ros2
+
+# Franka's own real-hardware smoke tests, run in GitHub Actions against
+# franka-sim instead of an FR3.
+#
+# Upstream franka_ros2 skips these in its own CI
+# (`colcon test ... --ctest-args --exclude-regex test_hardware`) because they
+# open an FCI connection and move the robot. franka-sim speaks that same wire
+# protocol, so the two excluded ctest entries become ordinary CI:
+#
+#   test_test_hardware_example_controllers.py   42 launch-test cases
+#   test_test_hardware_generic_controller.py     3 launch-test cases
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly: catches upstream drift and franka-sim regressions without a push.
+    - cron: '17 4 * * 1'
+
+env:
+  # Upstream frankarobotics/franka_ros2, branch jazzy. Bumping this one line is
+  # the whole upgrade procedure:
+  #   git ls-remote https://github.com/frankarobotics/franka_ros2.git jazzy
+  FRANKA_ROS2_REF: 6cedf7f1a2ca280c433f643eae697be23eb2a15e
+  # Tag for the image built from upstream's own Dockerfile.
+  FRANKA_ROS2_IMAGE: franka_ros2:ci
+  # The simulated robot. Host networking, so this is the address the ROS 2
+  # hardware interface connects to.
+  ROBOT_IP: 127.0.0.1
+  SIM_CONTAINER: franka-sim
+
+jobs:
+  hardware-tests:
+    name: franka_bringup hardware tests
+    runs-on: ubuntu-latest
+    # On a 12-core box, cold: 7.7 min image build, 11.5 min colcon build,
+    # 4.6 min tests. A 2-core runner roughly doubles the two builds; the tests
+    # are fixed sleeps and barely move. The gha cache only covers the apt
+    # layers -- see examples/franka_ros2/README.md.
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      # Into src/, so colcon finds it: the workspace root is $GITHUB_WORKSPACE.
+      - name: Checkout franka_ros2 (upstream, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: frankarobotics/franka_ros2
+          ref: ${{ env.FRANKA_ROS2_REF }}
+          path: src/franka_ros2
+
+      - name: Start a simulated FR3
+        uses: BarisYazici/libfranka-sim@main
+        with:
+          image: ghcr.io/barisyazici/franka-sim
+          tag: edge
+          container-name: ${{ env.SIM_CONTAINER }}
+          # Defaults are what these tests need: FCI on 1337 and the gripper
+          # server on 1338 (gripper_example_controller uses it), no fault
+          # injection. To make the run adversarial, add
+          #   args: '--enforce-comm-constraints --enforce-motion-limits'
+          # The action blocks until franka-sim-check completes a real Connect
+          # handshake, so the next step can assume a live robot.
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Upstream's Dockerfile installs the apt dependencies and then deletes
+      # its copy of the source tree, so the image is a toolchain, not a
+      # workspace. The sources come from the bind mount below.
+      - name: Build the upstream franka_ros2 image
+        uses: docker/build-push-action@v6
+        with:
+          context: src/franka_ros2
+          load: true
+          push: false
+          tags: ${{ env.FRANKA_ROS2_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the workspace and run the hardware tests
+        run: |
+          # --network host: the FCI is a 1 kHz UDP loop and the sim runs with
+          # host networking, so 127.0.0.1 must mean the same thing in both.
+          # --entrypoint /bin/bash: the image entrypoint would re-run
+          # `vcs import` into /ros2_ws, which is not the mounted workspace.
+          # The container user is uid 1001, the same uid the runner checks the
+          # workspace out as, so build artifacts stay writable on the host.
+          docker run --rm --network host --entrypoint /bin/bash \
+            -e ROBOT_IP -v "$GITHUB_WORKSPACE:/ros" "$FRANKA_ROS2_IMAGE" -c "$(cat <<'EOS'
+          set -eo pipefail
+          cd /ros
+          . /opt/ros/jazzy/setup.sh
+
+          # Pull the source dependencies upstream pins (libfranka, ros2_control,
+          # franka_description, ...) into the mounted src/.
+          vcs import src < src/franka_ros2/dependency.repos --recursive --skip-existing
+
+          # The manage_overruns patch is what upstream's entrypoint applies;
+          # franka_arm.ros2_control.xacro sets the attribute it adds, so the
+          # hardware component fails to parse without it. --check keeps reruns
+          # on a warm workspace idempotent.
+          if git -C src/ros2_control apply --check src/franka_ros2/patches/manage_overruns.patch 2>/dev/null; then
+            git -C src/ros2_control apply src/franka_ros2/patches/manage_overruns.patch
+          fi
+
+          # Cutting these five prunes the mobile/Gazebo branch of
+          # franka_bringup's dependency graph, which nothing in the two hardware
+          # tests touches: 17 of the workspace's 45 packages get built instead of
+          # 35. The same list has to be passed to `colcon test`, which otherwise
+          # resolves franka_bringup's full package.xml closure and fails on the
+          # packages that were never built.
+          IGNORE=(franka_mobile franka_gazebo_bringup franka_mobile_sensors
+                  franka_vision_and_manipulation_kit franka_mobile_fr3_duo_moveit_config)
+
+          # -DROBOT_IP is baked into CTestTestfile.cmake at configure time.
+          colcon build \
+            --packages-up-to franka_bringup \
+            --packages-ignore "${IGNORE[@]}" \
+            --cmake-args -DBUILD_TESTING=ON -DCHECK_TIDY=OFF -DROBOT_IP="$ROBOT_IP"
+
+          . install/setup.sh
+
+          # --return-code-on-test-failure: colcon test exits 0 on failures.
+          colcon test --packages-select franka_bringup \
+            --packages-ignore "${IGNORE[@]}" \
+            --ctest-args -R test_hardware \
+            --event-handlers console_direct+ \
+            --return-code-on-test-failure
+
+          colcon test-result --verbose
+          EOS
+          )"
+
+      - name: franka-sim logs
+        if: failure()
+        run: docker logs "$SIM_CONTAINER" || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: franka_bringup-test-results
+          path: |
+            build/franka_bringup/test_results
+            log/latest_test
+          if-no-files-found: warn
