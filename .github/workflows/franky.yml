@@ -106,7 +106,12 @@ jobs:
       - name: Run franky's integration tests
         env:
           FRANKA_SIM_HOST: ${{ env.ROBOT_IP }}
-        run: examples/franky/run-tests.sh "$TESTS_DIR/test_integration_franky_sim.py"
+        # test_gripper_grasp_success asserts that grasping thin air succeeds --
+        # franky-sim's position-move convention. A real hand, and this sim,
+        # close until the fingers stall and answer false. See the README.
+        run: >-
+          examples/franky/run-tests.sh "$TESTS_DIR/test_integration_franky_sim.py"
+          -k 'not test_gripper_grasp_success'
 
       - name: franka-sim logs
         if: failure()

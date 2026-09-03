@@ -41,7 +41,7 @@ The 19 tests in the file, in this order, each with its own
 | `test_motion_callback_fires_every_time_step` | a 5 s velocity motion with `register_callback` | 5000–6000 invocations, in order, `rel_time` deltas equal to the reported `time_step` |
 | `test_gripper_homing` | `Gripper.homing()` | `max_width` 0.08 m, width unchanged |
 | `test_gripper_move` | `Gripper.move()` to 0.08/0.04/0.01/0.06/0.0 m | width within 5 mm each time |
-| `test_gripper_grasp_success` | `grasp(0.04, …, epsilon 0.02)` from fully open | returns `True`, `is_grasped` |
+| `test_gripper_grasp_success` | `grasp(0.04, …, epsilon 0.02)` from fully open, nothing between the fingers | returns `True`, `is_grasped` — **expected failure on franka-sim**, deselected (see below) |
 | `test_gripper_grasp_failure` | `grasp(0.09, …, epsilon 0.005)` — beyond the 0.08 m maximum | `CommandException`, not `is_grasped` |
 | `test_gripper_stop` | `stop()` on an idle gripper | returns `True` |
 | `test_motion_reuse_raises` | `move()` the same motion object twice, sync and as an async preemption | `MotionReuseException` both times, a fresh motion still works |
@@ -106,23 +106,48 @@ The suite takes about a minute either way.
 ## franka-sim version
 
 franka-sim ≥ 1.1.3 — `ghcr.io/barisyazici/franka-sim:1.1.3`, which is what
-the workflow's `tag: latest` resolves to; all 19 pass. On 1.1.2 five fail:
+the workflow's `tag: latest` resolves to: 18 of 19 pass, and the one that does
+not is deselected in the workflow on purpose (below). On 1.1.2 five fail:
 
 - `test_joint_impedance_motion`, `test_cartesian_impedance_motion`,
   `test_cartesian_impedance_nullspace_posture`: the `StopMove` that ends an
   asynchronous impedance motion must make the interrupted Move reply
   `kPreempted`, which libfranka turns into the `ControlException` a stopped
   motion raises. 1.1.2 replied `kSuccess`, which falls through to
-  `ProtocolException: Unexpected reply to a Move command`.
-- `test_gripper_grasp_success`, `test_gripper_grasp_failure`: libfranka calls a
-  grasp successful when the final width lands within the epsilon band around
-  the *requested* width. 1.1.2 used a stall heuristic instead, so with nothing
-  between the fingers `grasp(0.04, …, epsilon 0.02)` reported failure and
-  `grasp(0.09, …, epsilon 0.005)` reported success, each the opposite of a
-  real hand.
+  `ProtocolException: Unexpected reply to a Move command`. The null-space
+  posture test additionally needed a physics fix: the Menagerie `fr3v2` model
+  collides the base and shoulder hulls, which overlap by ~0.1 mm around
+  q1 ≈ 0.22 rad and braked joint 1 under a compliant controller. (Menagerie's
+  other Franka models ship the exclude; 1.1.3 adds it.)
+- `test_gripper_grasp_failure`: `grasp(0.09, …)` is outside the 0.08 m stroke;
+  libfranka expects `kFail` → `CommandException`, and 1.1.2 answered
+  `kUnsuccessful` (`False`) instead.
+- `test_gripper_grasp_success` — fixed *differently*, see below.
 
-Both are fixed in 1.1.3. Pin `tag:` in the workflow if you need to hold a
-version; anything below 1.1.3 is red on those five and green on the other 14.
+### The expected failure: `test_gripper_grasp_success`
+
+The test opens the hand to 0.08 m, calls `grasp(0.04, …, epsilon 0.02/0.02)`
+with **nothing between the fingers** and asserts that it succeeds. That is
+franky-sim's convention (a grasp is a position move to the requested width),
+not the robot's. A real Franka Hand closes under force until the fingers
+stall — on an object, or on each other at zero — and only then checks
+`width − ε_inner < final < width + ε_outer`; a grasp of thin air stops at 0,
+is outside the band, and returns `false` (libfranka: "true if an object has
+been grasped, false otherwise"; the vendor `grasp_object.cpp` relies on it).
+franka-sim 1.1.3 does what the hand does, so this test fails against it by
+design, and the workflow runs the suite with
+`-k 'not test_gripper_grasp_success'`.
+With an object between the fingers the same call succeeds: franka-sim 1.1.3
+adds `--gripper-object-width W` (env `FRANKA_SIM_GRIPPER_OBJECT_WIDTH`), a
+rigid virtual object the fingers stall on, for both gripper backends. It is
+not used here because `test_gripper_move` then fails instead — it expects
+the fingers to reach 0.01 m and 0.0 m, which an object forbids — so the
+suite as written cannot be green on a faithful hand with or without an
+object. Deselecting the one test that encodes the other convention is the
+honest reading.
+
+Pin `tag:` in the workflow if you need to hold a version; anything below
+1.1.3 is red on the five above.
 
 ## Motion-limit enforcement
 
