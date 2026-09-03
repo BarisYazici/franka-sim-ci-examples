@@ -70,7 +70,7 @@ jobs:
           path: src/franka_ros2
 
       - name: Start a simulated FR3
-        uses: BarisYazici/libfranka-sim@main
+        uses: BarisYazici/libfranka-sim@v1
         with:
           image: ghcr.io/barisyazici/franka-sim
           tag: edge

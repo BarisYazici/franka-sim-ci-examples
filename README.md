@@ -30,7 +30,7 @@ jobs:
 
       # 1. The robot. Blocks until a real Connect handshake succeeds, so the
       #    next step can assume a live FCI.
-      - uses: BarisYazici/libfranka-sim@main
+      - uses: BarisYazici/libfranka-sim@v1
 
       # 2. Your code.
       - run: ./build.sh
