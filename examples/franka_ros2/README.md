@@ -117,6 +117,37 @@ not cross-talk) and `TIMEOUT 500`.
   since we bypass the entrypoint the workflow applies it itself (guarded by
   `git apply --check`, so reruns on a warm workspace are idempotent).
 
+## Two lanes
+
+The workflow runs the same tests twice, as a matrix:
+
+| lane | sim args | what it proves |
+|---|---|---|
+| `nominal` | none | The stack drives the simulated robot end to end. Every limit violation is logged `(not enforced)` and nothing aborts. |
+| `motion-limits` | `--enforce-motion-limits` | The same, with violations raised as reflex aborts (`kReflexAborted`, `robot_mode == kReflex`) the way Control raises them. |
+
+Both are green today, and the second one taught us something about the code
+under test. In every example-controller launch the last command packet before
+`StopMove` is a byte-identical repeat of the previous one: ros2_control does
+not reset command interfaces when a controller deactivates, no example
+controller has an `on_deactivate`, and `FrankaHardwareInterface::write()` still
+sees the old mode for one RT cycle after the controller's last `update()`, so
+the commanded velocity drops to zero within a millisecond. The sim reports it
+as `cartesian_motion_generator_velocity_discontinuity` (or the joint/elbow
+equivalent) and, in the `motion-limits` lane, aborts the motion about 1 ms
+before the client's own `StopMove`. The tests still pass because
+`Robot::stopRobot()` has already discarded the `ActiveControl` by the time
+the reflex could be read back, and the next activation runs
+`automaticErrorRecovery()` in its catch path — which is presumably what
+happens on a real robot too, silently.
+
+`--enforce-comm-constraints` is deliberately not in the matrix. With it on,
+two launches abort with `communication_constraints_violation: 20 consecutive
+lost command cycles` 200–400 ms after a torque-mode Move starts: the
+controller_manager in the container cannot get `SCHED_FIFO` and pauses for
+20 ms during controller activation. That is the runner, not franka_ros2. Turn
+it on when the job runs on a machine with an RT kernel.
+
 ## Caveats
 
 - **The GitHub Actions cache only covers the apt layers.** Upstream's

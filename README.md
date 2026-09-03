@@ -50,10 +50,13 @@ Three things to get right:
   CMake/ctest suite, `robot_ip:=127.0.0.1` for a ROS 2 launch file — wherever
   your stack normally takes the robot's IP.
 - **Decide how adversarial the run should be.** By default the sim just works.
-  Passing `args: '--enforce-comm-constraints --enforce-motion-limits'` makes it
-  abort motions the way a real FR3 does — dropped command cycles and commanded
-  discontinuities raise the matching reflex error — which is what turns a green
-  build into evidence that your recovery paths work.
+  Passing `args: '--enforce-motion-limits'` makes it abort motions the way a
+  real FR3 does — commanded discontinuities and limit violations raise the
+  matching reflex error — which is what turns a green build into evidence that
+  your recovery paths work. The franka_ros2 example runs both as a matrix.
+  `--enforce-comm-constraints` exists too, but on a hosted runner without an
+  RT kernel it mostly measures the runner's jitter (20-cycle command gaps at
+  controller activation), so keep it for machines you control.
 
 See [franka-sim's CI docs](https://github.com/BarisYazici/libfranka-sim/blob/main/docs/ci.md)
 for the action inputs, the Docker image, and the pytest fixture.

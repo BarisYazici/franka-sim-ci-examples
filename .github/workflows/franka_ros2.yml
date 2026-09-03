@@ -33,8 +33,24 @@ env:
 
 jobs:
   hardware-tests:
-    name: franka_bringup hardware tests
+    name: franka_bringup hardware tests (${{ matrix.lane }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Permissive: the sim logs every limit violation but aborts nothing,
+          # which is how the tests see a real robot whose reflexes are never
+          # read back (franka_hardware discards the ActiveControl on stop).
+          - lane: nominal
+            args: ''
+          # Adversarial: motion-limit violations become reflex aborts, exactly
+          # as Control raises them. Communication constraints stay off on
+          # purpose -- a hosted runner without an RT kernel drops 20-cycle
+          # command gaps at controller activation, which is runner jitter,
+          # not the code under test.
+          - lane: motion-limits
+            args: '--enforce-motion-limits'
     # On a 12-core box, cold: 7.7 min image build, 11.5 min colcon build,
     # 4.6 min tests. A 2-core runner roughly doubles the two builds; the tests
     # are fixed sleeps and barely move. The gha cache only covers the apt
@@ -59,12 +75,11 @@ jobs:
           image: ghcr.io/barisyazici/franka-sim
           tag: edge
           container-name: ${{ env.SIM_CONTAINER }}
-          # Defaults are what these tests need: FCI on 1337 and the gripper
-          # server on 1338 (gripper_example_controller uses it), no fault
-          # injection. To make the run adversarial, add
-          #   args: '--enforce-comm-constraints --enforce-motion-limits'
-          # The action blocks until franka-sim-check completes a real Connect
-          # handshake, so the next step can assume a live robot.
+          args: ${{ matrix.args }}
+          # Both lanes need the defaults otherwise: FCI on 1337 and the gripper
+          # server on 1338 (gripper_example_controller uses it). The action
+          # blocks until franka-sim-check completes a real Connect handshake,
+          # so the next step can assume a live robot.
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -144,7 +159,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: franka_bringup-test-results
+          name: franka_bringup-test-results-${{ matrix.lane }}
           path: |
             build/franka_bringup/test_results
             log/latest_test
