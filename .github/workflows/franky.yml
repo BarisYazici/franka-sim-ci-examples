@@ -1,0 +1,92 @@
+name: franky
+
+# franky's quick-start, run in GitHub Actions against franka-sim instead of an
+# FR3.
+#
+# franky (https://github.com/TimSchneider42/franky) is a Python/C++ wrapper
+# around libfranka: a Ruckig planner in front of the real control loop. Its
+# examples all begin `Robot("172.16.0.2")`, so none of them can run in CI
+# without a robot. The wheels on PyPI bundle libfranka 0.21.2, which speaks
+# FCI protocol v10 -- the same protocol franka-sim serves -- so pointing the
+# same calls at 127.0.0.1 is the entire change.
+#
+# This is a pip-only stack: no Docker build, no colcon workspace. The whole
+# job is `pip install franky-control` plus the sim action.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly: catches franky releases and franka-sim regressions without a push.
+    - cron: '43 4 * * 1'
+
+env:
+  # The wheel pins the libfranka it bundles; bumping this one line is the whole
+  # upgrade procedure. Only franky wheels built against libfranka >= 0.20 speak
+  # FCI v10 -- see examples/franky/README.md.
+  FRANKY_VERSION: 2.0.0
+  # Host networking, so this is the address franky connects to.
+  ROBOT_IP: 127.0.0.1
+  SIM_CONTAINER: franka-sim
+
+jobs:
+  quick-start:
+    name: franky quick-start (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Permissive: the sim logs limit violations but aborts nothing, so
+          # every motion the quick-start commands completes.
+          - lane: nominal
+            args: ''
+            reflex: false
+          # Adversarial: violations become reflex aborts, exactly as Control
+          # raises them, so reflex.py can provoke one and recover from it.
+          # Communication constraints stay off on purpose -- a hosted runner
+          # without an RT kernel measures its own jitter, not franky.
+          - lane: motion-limits
+            args: '--enforce-motion-limits'
+            reflex: true
+    # Both lanes are about a minute of wall time: ~20 s for the wheel, ~10 s
+    # for the sim to come up, under 40 s of robot motion.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Start a simulated FR3
+        uses: BarisYazici/libfranka-sim@v1
+        with:
+          image: ghcr.io/barisyazici/franka-sim
+          tag: latest
+          container-name: ${{ env.SIM_CONTAINER }}
+          args: ${{ matrix.args }}
+          # Defaults otherwise: FCI on 1337 and the gripper server on 1338,
+          # which smoke.py's Gripper() needs. The action blocks until
+          # franka-sim-check completes a real Connect handshake, so the steps
+          # below can assume a live robot.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install franky
+        run: pip install "franky-control==${FRANKY_VERSION}"
+
+      # timeout: a wedged FCI session would otherwise sit until the job's
+      # timeout-minutes rather than failing the step it belongs to.
+      - name: Quick-start smoke test
+        run: timeout 120 python examples/franky/smoke.py --host "$ROBOT_IP"
+
+      - name: Reflex and recovery
+        if: matrix.reflex
+        run: timeout 120 python examples/franky/reflex.py --host "$ROBOT_IP"
+
+      - name: franka-sim logs
+        if: failure()
+        run: docker logs "$SIM_CONTAINER" || true
