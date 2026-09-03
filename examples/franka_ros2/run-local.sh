@@ -177,7 +177,18 @@ if [ "$FRANKA_ROS2_GIT_PROTOCOL0" = 1 ]; then
     fi
     command -v vcs >/dev/null 2>&1 || pip install --user vcstool
   fi
-  vcs import "$WS/src" <"$SRC/dependency.repos" --recursive --skip-existing
+  # vcstool still contacts every remote for repositories it already has, and
+  # GitHub rate-limits unauthenticated fetches; on a warm workspace skip the
+  # import entirely once every repository named in dependency.repos is present.
+  missing=0
+  while IFS= read -r name; do
+    [ -d "$WS/src/$name" ] || missing=1
+  done < <(sed -n 's/^  \([^ :][^:]*\):$/\1/p' "$SRC/dependency.repos")
+  if [ "$missing" -eq 0 ]; then
+    echo "all dependency.repos repositories present, skipping host-side vcs import"
+  else
+    vcs import "$WS/src" <"$SRC/dependency.repos" --recursive --skip-existing
+  fi
   step_done
 fi
 
