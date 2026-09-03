@@ -106,7 +106,8 @@ jobs:
           # The container user is uid 1001, the same uid the runner checks the
           # workspace out as, so build artifacts stay writable on the host.
           docker run --rm --network host --entrypoint /bin/bash \
-            -e ROBOT_IP -v "$GITHUB_WORKSPACE:/ros" "$FRANKA_ROS2_IMAGE" -c "$(cat <<'EOS'
+            -e ROBOT_IP -e PATCH_DIR=/ros/examples/franka_ros2/patches \
+            -v "$GITHUB_WORKSPACE:/ros" "$FRANKA_ROS2_IMAGE" -c "$(cat <<'EOS'
           set -eo pipefail
           cd /ros
           . /opt/ros/jazzy/setup.sh
@@ -121,6 +122,14 @@ jobs:
           # on a warm workspace idempotent.
           if git -C src/ros2_control apply --check src/franka_ros2/patches/manage_overruns.patch 2>/dev/null; then
             git -C src/ros2_control apply src/franka_ros2/patches/manage_overruns.patch
+          fi
+          # Stop the hardware before deactivating controllers at shutdown
+          # (see examples/franka_ros2/README.md, 'Two lanes'): without it
+          # franka_hardware re-sends the last setpoint for one cycle after the
+          # controller stops, a velocity step the sim reports as a discontinuity.
+          # Pending upstream in ros2_control; applied here the same way.
+          if git -C src/ros2_control apply --check "$PATCH_DIR/stop-hardware-before-shutdown.patch" 2>/dev/null; then
+            git -C src/ros2_control apply "$PATCH_DIR/stop-hardware-before-shutdown.patch"
           fi
 
           # Cutting these five prunes the mobile/Gazebo branch of

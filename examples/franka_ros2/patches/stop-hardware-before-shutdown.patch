@@ -1,0 +1,24 @@
+diff --git a/controller_manager/src/controller_manager.cpp b/controller_manager/src/controller_manager.cpp
+index 790fd5ff..0373e940 100644
+--- a/controller_manager/src/controller_manager.cpp
++++ b/controller_manager/src/controller_manager.cpp
+@@ -628,6 +628,19 @@ bool ControllerManager::shutdown_controllers()
+   std::lock_guard<std::recursive_mutex> guard(rt_controllers_wrapper_.controllers_lock_);
+   std::vector<ControllerSpec> controllers_list = rt_controllers_wrapper_.get_updated_list(guard);
+   bool ctrls_shutdown_status = true;
++  // Let the hardware components leave the command modes of the still active controllers before
++  // those controllers are deactivated: until shutdown_components() is called below the read/update/
++  // write loop keeps running, and a component that was not told to stop keeps writing the last
++  // command it was given (a frozen setpoint, i.e. a step to zero velocity for the robot).
++  std::vector<std::string> active_controllers_list;
++  for (const auto & controller : controllers_list)
++  {
++    if (is_controller_active(controller.c))
++    {
++      active_controllers_list.push_back(controller.info.name);
++    }
++  }
++  perform_hardware_command_mode_change(controllers_list, {}, active_controllers_list, "shutdown");
+   for (auto & controller : controllers_list)
+   {
+     if (is_controller_active(controller.c))

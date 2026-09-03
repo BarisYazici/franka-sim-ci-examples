@@ -150,6 +150,14 @@ it on when the job runs on a machine with an RT kernel.
 
 ## Caveats
 
+- **The `stop-hardware-before-shutdown` patch** (`examples/franka_ros2/patches/`,
+  applied to `src/ros2_control` the same way). ros2_control's
+  `shutdown_controllers()` deactivates controllers without first telling the
+  hardware to leave its command mode, so `franka_hardware` re-sends the last
+  setpoint for one RT cycle: a velocity step the sim reports as a
+  discontinuity and, in the `motion-limits` lane, a reflex abort at every
+  stop. The patch performs the command-mode change first, as `manage_switch()`
+  already does. Pending upstream in ros2_control.
 - **The GitHub Actions cache only covers the apt layers.** Upstream's
   `Dockerfile` does `COPY . /ros2_ws/src` — including `.git`, whose contents
   differ on every checkout — so every layer from that `COPY` on is a miss. The

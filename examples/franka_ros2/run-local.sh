@@ -217,6 +217,22 @@ if git -C src/ros2_control apply --check src/franka_ros2/patches/manage_overruns
   git -C src/ros2_control apply src/franka_ros2/patches/manage_overruns.patch
 fi
 
+# Stop the hardware before deactivating controllers at shutdown
+
+# (see examples/franka_ros2/README.md, 'Two lanes'): without it
+
+# franka_hardware re-sends the last setpoint for one cycle after the
+
+# controller stops, a velocity step the sim reports as a discontinuity.
+
+# Pending upstream in ros2_control; applied here the same way.
+
+if git -C src/ros2_control apply --check "$PATCH_DIR/stop-hardware-before-shutdown.patch" 2>/dev/null; then
+
+  git -C src/ros2_control apply "$PATCH_DIR/stop-hardware-before-shutdown.patch"
+
+fi
+
 IGNORE=(franka_mobile franka_gazebo_bringup franka_mobile_sensors
         franka_vision_and_manipulation_kit franka_mobile_fr3_duo_moveit_config)
 
@@ -242,5 +258,7 @@ step "colcon build + hardware tests"
 # --entrypoint /bin/bash because the image entrypoint would re-run `vcs import`
 # into /ros2_ws, which is not the mounted workspace.
 docker run --rm --network host --entrypoint /bin/bash \
-  -e ROBOT_IP="$ROBOT_IP" -v "$WS:/ros" "$FRANKA_ROS2_IMAGE" -c "$WORKSPACE_SCRIPT"
+  -e ROBOT_IP="$ROBOT_IP" -e PATCH_DIR=/patches \
+  -v "$REPO_ROOT/examples/franka_ros2/patches:/patches:ro" \
+  -v "$WS:/ros" "$FRANKA_ROS2_IMAGE" -c "$WORKSPACE_SCRIPT"
 step_done
