@@ -147,6 +147,20 @@ moves the stand-in makes are within limits too.
 `--enforce-comm-constraints` is not worth a lane on a hosted runner: without an
 RT kernel it measures the runner's jitter, not franky.
 
+## State carried between clients
+
+franky's own `sim_server_context()` gives every test a fresh simulator, and
+`run-tests.sh` gives every test a fresh container, so no test sees the pose
+the previous one left the arm in. A real robot keeps its pose between clients,
+and so does a long-lived franka-sim: run the suite against one shared server
+and the first torque test after the motion tests trips
+`tau_J_range_violation` on joint 7 (12.35 Nm against the 12 Nm limit) —
+`test_simple_torque_motion_initial_torque` applies its open-loop torque from
+wherever the arm happens to be. That is the sim being faithful, not a bug;
+it is also why a shared sim is the harder and more realistic setup. If you
+run one server for a whole suite, start each test from a known pose
+(`robot.move(JointMotion(home))`) the way you would on hardware.
+
 ## Protocol and versions
 
 franky ships as a binary wheel with libfranka statically linked, so **the wheel
