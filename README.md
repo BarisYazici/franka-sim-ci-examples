@@ -15,7 +15,7 @@ badge is what they do against a simulated robot on every push.
 | Example | Upstream | What runs | Status |
 | --- | --- | --- | --- |
 | [franka_ros2](examples/franka_ros2/) | [`frankarobotics/franka_ros2`](https://github.com/frankarobotics/franka_ros2) `jazzy` @ [`6cedf7f`](https://github.com/frankarobotics/franka_ros2/commit/6cedf7f1a2ca280c433f643eae697be23eb2a15e) | `franka_bringup` hardware smoke tests, 24 controller launches, 47 tests | ![franka_ros2](https://github.com/BarisYazici/franka-sim-examples/actions/workflows/franka_ros2.yml/badge.svg) |
-| [franky](examples/franky/) | [`TimSchneider42/franky`](https://github.com/TimSchneider42/franky) [`franky-control==2.0.0`](https://pypi.org/project/franky-control/) | The quick-start asserted end to end — joint, Cartesian and gripper motion — plus a provoked reflex abort and recovery | ![franky](https://github.com/BarisYazici/franka-sim-examples/actions/workflows/franky.yml/badge.svg) |
+| [franky](examples/franky/) | [`TimSchneider42/franky`](https://github.com/TimSchneider42/franky) [`v2.0.0`](https://github.com/TimSchneider42/franky/tree/v2.0.0) / [`franky-control==2.0.0`](https://pypi.org/project/franky-control/) | `tests/pytest/test_integration_franky_sim.py`, franky's own integration suite, unmodified: 19 tests over every motion type, torque control, motion callbacks and the gripper | ![franky](https://github.com/BarisYazici/franka-sim-examples/actions/workflows/franky.yml/badge.svg) |
 
 ## Copy this into your own repo
 
@@ -41,8 +41,8 @@ jobs:
 ```
 
 The franky example is the whole of that, minus step 2: a `pip install` stack
-needs no Docker build and no workspace, so its job is the action plus two
-`python` invocations.
+needs no Docker build and no workspace, so its job is the action, a `curl` of
+upstream's test file, and `pytest` once per test.
 
 Three things to get right:
 
@@ -58,7 +58,9 @@ Three things to get right:
   Passing `args: '--enforce-motion-limits'` makes it abort motions the way a
   real FR3 does — commanded discontinuities and limit violations raise the
   matching reflex error — which is what turns a green build into evidence that
-  your recovery paths work. Both examples here run both as a matrix.
+  your recovery paths work. The franka_ros2 example runs both as a matrix; the
+  franky example runs only the default, because two of upstream's torque tests
+  legitimately exceed a joint velocity limit (see its README).
   `--enforce-comm-constraints` exists too, but on a hosted runner without an
   RT kernel it mostly measures the runner's jitter (20-cycle command gaps at
   controller activation), so keep it for machines you control.

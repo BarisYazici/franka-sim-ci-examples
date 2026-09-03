@@ -1,17 +1,33 @@
 name: franky
 
-# franky's quick-start, run in GitHub Actions against franka-sim instead of an
-# FR3.
+# franky's own integration test suite, run in GitHub Actions against franka-sim
+# instead of an FR3.
 #
 # franky (https://github.com/TimSchneider42/franky) is a Python/C++ wrapper
-# around libfranka: a Ruckig planner in front of the real control loop. Its
-# examples all begin `Robot("172.16.0.2")`, so none of them can run in CI
-# without a robot. The wheels on PyPI bundle libfranka 0.21.2, which speaks
-# FCI protocol v10 -- the same protocol franka-sim serves -- so pointing the
-# same calls at 127.0.0.1 is the entire change.
+# around libfranka: a Ruckig planner in front of the real control loop. It
+# ships tests/pytest/test_integration_franky_sim.py -- 19 tests that connect a
+# franky.Robot and franky.Gripper to a simulated robot and drive every motion
+# type through it: joint/Cartesian position and velocity, joint/Cartesian
+# impedance (motions and trackers, null-space posture), raw torques, motion
+# callbacks, gripper homing/move/grasp/stop, motion-object reuse.
+#
+# Upstream those tests start franky's own MuJoCo simulator and FCI server
+# in-process (the franky_sim package). franka-sim serves the same FCI wire
+# protocol, so the same file runs unmodified against it: the job fetches the
+# test file from the franky tag matching the installed wheel and puts a small
+# stand-in for franky_sim (examples/franky/franky_sim/) on PYTHONPATH that,
+# instead of starting a simulator, hands the tests 127.0.0.1 and moves the arm
+# back to the initial configuration a fresh simulator would have.
 #
 # This is a pip-only stack: no Docker build, no colcon workspace. The whole
-# job is `pip install franky-control` plus the sim action.
+# job is `pip install franky-control pytest pytest-timeout`, a curl, the sim
+# action, and pytest -- one process per test (examples/franky/run-tests.sh).
+#
+# Needs franka-sim >= 1.1.3 (`tag: latest` below). On 1.1.2 five of the 19
+# fail: three impedance tests, because the sim answered the Move interrupted
+# by StopMove with kSuccess instead of kPreempted; two gripper grasp tests,
+# because grasp success was judged by a stall heuristic instead of
+# libfranka's epsilon band -- see examples/franky/README.md.
 
 on:
   push:
@@ -24,34 +40,22 @@ on:
 env:
   # The wheel pins the libfranka it bundles; bumping this one line is the whole
   # upgrade procedure. Only franky wheels built against libfranka >= 0.20 speak
-  # FCI v10 -- see examples/franky/README.md.
+  # FCI v10 -- see examples/franky/README.md. The test file is fetched from the
+  # franky tag v${FRANKY_VERSION}, so tests and wheel always match.
   FRANKY_VERSION: 2.0.0
+  FRANKY_REPO: https://github.com/TimSchneider42/franky
   # Host networking, so this is the address franky connects to.
   ROBOT_IP: 127.0.0.1
   SIM_CONTAINER: franka-sim
+  # Where the fetched test file goes. Untracked; the checkout is disposable.
+  TESTS_DIR: ${{ github.workspace }}/franky-tests
 
 jobs:
-  quick-start:
-    name: franky quick-start (${{ matrix.lane }})
+  integration-tests:
+    name: franky integration tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Permissive: the sim logs limit violations but aborts nothing, so
-          # every motion the quick-start commands completes.
-          - lane: nominal
-            args: ''
-            reflex: false
-          # Adversarial: violations become reflex aborts, exactly as Control
-          # raises them, so reflex.py can provoke one and recover from it.
-          # Communication constraints stay off on purpose -- a hosted runner
-          # without an RT kernel measures its own jitter, not franky.
-          - lane: motion-limits
-            args: '--enforce-motion-limits'
-            reflex: true
-    # Both lanes are about a minute of wall time: ~20 s for the wheel, ~10 s
-    # for the sim to come up, under 40 s of robot motion.
+    # About two minutes of wall time: ~20 s for the wheel, ~10 s for the sim
+    # to come up, ~60 s of robot motion.
     timeout-minutes: 15
 
     steps:
@@ -64,28 +68,45 @@ jobs:
           image: ghcr.io/barisyazici/franka-sim
           tag: latest
           container-name: ${{ env.SIM_CONTAINER }}
-          args: ${{ matrix.args }}
-          # Defaults otherwise: FCI on 1337 and the gripper server on 1338,
-          # which smoke.py's Gripper() needs. The action blocks until
-          # franka-sim-check completes a real Connect handshake, so the steps
-          # below can assume a live robot.
+          # Default args: the sim logs limit violations but aborts nothing.
+          # With --enforce-motion-limits the two SimpleTorqueMotion tests
+          # exceed the joint-1 velocity limit and reflex, as an FR3 would; add
+          # that lane with `-k 'not (simple_torque_motion and not
+          # signal_timeout)'` if you want it (17 pass).
+          #
+          # FCI on 1337 and the gripper server on 1338, which the five gripper
+          # tests need. The action blocks until franka-sim-check completes a
+          # real Connect handshake, so the steps below can assume a live robot.
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install franky
-        run: pip install "franky-control==${FRANKY_VERSION}"
+      # pytest-timeout: the test file's @pytest.mark.timeout markers need it.
+      - name: Install franky and pytest
+        run: pip install "franky-control==${FRANKY_VERSION}" pytest pytest-timeout
 
-      # timeout: a wedged FCI session would otherwise sit until the job's
-      # timeout-minutes rather than failing the step it belongs to.
-      - name: Quick-start smoke test
-        run: timeout 120 python examples/franky/smoke.py --host "$ROBOT_IP"
+      - name: Fetch franky's integration tests
+        run: |
+          tag="v${FRANKY_VERSION}"
+          echo "franky tag: $tag"
+          git ls-remote --tags "${FRANKY_REPO}.git" "refs/tags/${tag}"
+          mkdir -p "$TESTS_DIR"
+          curl -fsSL -o "$TESTS_DIR/test_integration_franky_sim.py" \
+            "https://raw.githubusercontent.com/TimSchneider42/franky/${tag}/tests/pytest/test_integration_franky_sim.py"
+          sha256sum "$TESTS_DIR/test_integration_franky_sim.py"
+          echo "$(grep -c '^def test_' "$TESTS_DIR/test_integration_franky_sim.py") tests"
 
-      - name: Reflex and recovery
-        if: matrix.reflex
-        run: timeout 120 python examples/franky/reflex.py --host "$ROBOT_IP"
+      # One pytest process per test, each under its own `timeout`: a failed
+      # test's franky.Robot would otherwise keep the sim's single client slot
+      # and wedge every test after it -- see run-tests.sh. The script puts the
+      # franky_sim stand-in on PYTHONPATH and passes ROBOT_IP through as
+      # FRANKA_SIM_HOST.
+      - name: Run franky's integration tests
+        env:
+          FRANKA_SIM_HOST: ${{ env.ROBOT_IP }}
+        run: examples/franky/run-tests.sh "$TESTS_DIR/test_integration_franky_sim.py"
 
       - name: franka-sim logs
         if: failure()

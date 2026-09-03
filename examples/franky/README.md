@@ -1,82 +1,151 @@
-# franky quick-start on franka-sim
+# franky's integration tests on franka-sim
 
 [`franky`](https://github.com/TimSchneider42/franky) is a Python/C++ wrapper
 around libfranka: a [Ruckig](https://github.com/pantor/ruckig) online planner in
-front of the real 1 kHz control loop, with a Python API thin enough that its
-README is six lines of motion code. Every one of those lines starts the same
-way:
+front of the real 1 kHz control loop. It ships an integration test suite,
 
-```python
-robot = Robot("172.16.0.2")
+```
+tests/pytest/test_integration_franky_sim.py
 ```
 
-which is why none of franky's examples appear in its CI — they need an FR3.
+that connects a `franky.Robot` and a `franky.Gripper` to a simulated robot and
+drives every motion type franky has through it. Upstream, the simulated robot
+is franky's own: each test starts a MuJoCo simulator and an FCI server
+in-process (the `franky_sim` package) and connects to that.
 [franka-sim](https://github.com/BarisYazici/libfranka-sim) serves the same FCI
-wire protocol, so the entire change is the address:
-
-```python
-robot = Robot("127.0.0.1", realtime_config=RealtimeConfig.Ignore)
-```
-
-[`../../.github/workflows/franky.yml`](../../.github/workflows/franky.yml) runs
-that on a stock `ubuntu-latest` runner. There is no Docker build and no
-workspace: `pip install franky-control`, start the sim action, run two scripts.
+wire protocol, so the same file runs unmodified against it.
+[`../../.github/workflows/franky.yml`](../../.github/workflows/franky.yml) does
+that on a stock `ubuntu-latest` runner: `pip install`, `curl` the test file
+from the franky tag matching the installed wheel, start the sim action, run
+`pytest` once per test.
 
 ## What runs
 
-### [`smoke.py`](smoke.py) — the quick-start, asserted
+The 19 tests in the file, in this order, each with its own
+`@pytest.mark.timeout`:
 
-Connect, read `RobotState`, then the three things a franky user does first:
+| test | what it drives | asserts |
+| --- | --- | --- |
+| `test_joint_position_control` | `JointWaypointMotion`, four 7-joint configurations | every joint within 0.03 rad |
+| `test_joint_velocity_control` | `JointVelocityWaypointMotion`, four sign patterns, 400 ms each | displacement sign matches the commanded velocity on all 7 joints |
+| `test_cartesian_position_control` | `CartesianMotion`, absolute targets ±x/±y/±z | end-effector within 2.5 cm |
+| `test_cartesian_velocity_control` | `CartesianVelocityWaypointMotion`, ±x/±y/±z, 500 ms each | displacement sign per axis |
+| `test_joint_impedance_motion` | `JointImpedanceMotion`, asynchronous, `stop()` after 1 s | joints within 0.03 rad of the target |
+| `test_cartesian_impedance_motion` | `CartesianImpedanceMotion`, asynchronous, `stop()` after 1 s | end-effector within 2.5 cm |
+| `test_cartesian_impedance_nullspace_posture` | `CartesianImpedanceMotion` holding the pose plus a `PostureTask`, per-joint and scalar stiffness | joints 1/3 counter-rotate along the self-motion manifold, end-effector undisturbed |
+| `test_joint_impedance_tracker` | `JointImpedanceTracker`, 100 ticks at 10 ms | joints within 0.03 rad |
+| `test_cartesian_impedance_tracker` | `CartesianImpedanceTracker`, 100 ticks at 10 ms | end-effector within 2.5 cm |
+| `test_simple_torque_motion` | `SimpleTorqueMotion`, 2 Nm on joint 1 fed at 100 Hz, `TorqueStopMotion` | joint 1 moved > 0.05 rad in the torque's direction |
+| `test_simple_torque_motion_initial_torque` | `SimpleTorqueMotion(initial_torque=…, signal_timeout=None)`, no `set_torque` | joint 1 moved > 0.05 rad |
+| `test_simple_torque_motion_signal_timeout` | `SimpleTorqueMotion` never fed | `TorqueSignalTimeoutException` within 2 s |
+| `test_motion_callback_fires_every_time_step` | a 5 s velocity motion with `register_callback` | 5000–6000 invocations, in order, `rel_time` deltas equal to the reported `time_step` |
+| `test_gripper_homing` | `Gripper.homing()` | `max_width` 0.08 m, width unchanged |
+| `test_gripper_move` | `Gripper.move()` to 0.08/0.04/0.01/0.06/0.0 m | width within 5 mm each time |
+| `test_gripper_grasp_success` | `grasp(0.04, …, epsilon 0.02)` from fully open | returns `True`, `is_grasped` |
+| `test_gripper_grasp_failure` | `grasp(0.09, …, epsilon 0.005)` — beyond the 0.08 m maximum | `CommandException`, not `is_grasped` |
+| `test_gripper_stop` | `stop()` on an idle gripper | returns `True` |
+| `test_motion_reuse_raises` | `move()` the same motion object twice, sync and as an async preemption | `MotionReuseException` both times, a fresh motion still works |
 
-| step | assertion |
-| --- | --- |
-| `JointMotion` — +0.2 rad on joint 1 | reached within 0.02 rad |
-| `CartesianMotion(..., ReferenceType.Relative)` — 5 cm | the resulting `O_T_EE` moved 5 cm ±5 mm |
-| `Gripper.open()` / `Gripper.move(0.02, 0.05)` | `gripper.width` within 5 mm of the target |
+Every assertion reads the state back off the wire, so a pass means the sim
+integrated the motion — not that the call returned. The callback test is the
+sharpest: it requires 1 kHz `RobotState` delivery with no dropped cycle for
+five seconds.
 
-Each assertion reads the state back off the wire, so a pass means the sim
-actually integrated the motion — not that the call returned.
+## The `franky_sim` stand-in
 
-### [`reflex.py`](reflex.py) — the adversarial lane
+The test file begins
 
-Only run against a sim started with `--enforce-motion-limits`. It commands
-`JointMotion` with joint 1 at 3.0 rad, outside the FR3's ±2.7437 rad range, and
-asserts that libfranka raises the reflex:
-
+```python
+from franky_sim import SimulationServer
+from franky_sim.mujoco_simulator import MujocoSimulator
 ```
-libfranka: Move command aborted: motion aborted by reflex!
-["joint_velocity_violation", "joint_motion_generator_velocity_limits_violation"]
+
+and every test wraps itself in
+
+```python
+with MujocoSimulator() as sim:
+    robot = sim.add_robot()
+    with SimulationServer(sim) as server:
+        server.run_async()
+        franky.Robot(robot.hostname, ...)
 ```
 
-Then `robot.recover_from_errors()`, and a normal move back to the start —
-proving the recovery path works, not just the failure.
+[`franky_sim/`](franky_sim/) here is a small package with the same two class
+names that starts nothing and hands the tests a hostname — `127.0.0.1`, or
+`$FRANKA_SIM_HOST`. It goes on `PYTHONPATH`; the test file is not touched. That
+is the entire adapter between franky's suite and franka-sim, with one addition:
 
-The *velocity* reflex is what fires, and that is the interesting part. The FR3's
-per-joint velocity limit is a function of position: it collapses to zero as the
-joint approaches its travel limit. franky's planner uses the constant limit, so
-its cruise speed becomes illegal at about 2.706 rad — the robot is refused ~0.04
-rad before it could ever reach the position limit. That is the real robot's
-behaviour, and no amount of reading franky's source would have predicted it.
+Upstream, every test gets a fresh simulator with the arm at
+`[0, 0, 0, -1.57, 0, 1.57, 0.785]`. Here all 19 run against one long-lived
+sim, and franka-sim holds the last pose across client sessions, so without help
+each test would start where the previous one stopped. Most tests would not
+care — their targets are relative, or absolute and reachable — but the
+impedance tests get one second to converge on an absolute target and fail from
+the pose `test_cartesian_velocity_control` leaves behind (the sim logs a 12 Nm
+torque spike at the start of the motion). So `MujocoSimulator.__enter__` does
+what a fresh upstream simulator would: it connects, moves the arm to that
+configuration (which is also franka-sim's own initial pose), and closes its
+session before the test opens its own. A no-op when the arm is already there.
 
-Sometimes only `joint_velocity_violation` is reported and sometimes the
-commanded-rate reflex `joint_motion_generator_velocity_limits_violation` too,
-depending on which crosses first in that millisecond; the script asserts on the
-former, which is in every abort.
+## One pytest process per test
 
-## Two lanes
+[`run-tests.sh`](run-tests.sh) collects the selected tests once and then runs
+`pytest` once per test, each under its own `timeout`. The workflow and
+`run-local.sh` both call it. The reason is what happens after a failure: the
+failing test's `franky.Robot` stays referenced from the traceback pytest keeps
+for the report, so its FCI session never closes; libfranka allows one client,
+so the next test blocks in `connect()` — inside C++, where `pytest-timeout`'s
+signal cannot reach it — and so does every test after that, until the job
+timeout. In a single process "1 failed" turns into "1 failed, 14 hung, no
+output for ten minutes". A process exit closes the socket unconditionally, so
+a failure costs one test.
 
-| lane | sim args | what it proves |
-|---|---|---|
-| `nominal` | none | The quick-start drives the simulated robot end to end. The sim log has zero warnings. |
-| `motion-limits` | `--enforce-motion-limits` | The same, plus a real reflex abort and a real recovery. The sim log has exactly one abort — the one `reflex.py` provokes. |
+The cost is ~1 s of interpreter start-up per test and the reset move above.
+The suite takes about a minute either way.
 
-`reflex.py` is skipped in the `nominal` lane rather than made conditional:
-nothing on the wire tells a client whether the sim is enforcing limits, so the
-lane is the switch.
+## franka-sim version
 
-`--enforce-comm-constraints` is deliberately not in the matrix. Without an RT
-kernel a hosted runner drops command cycles on its own, which measures the
-runner rather than franky.
+franka-sim ≥ 1.1.3 — `ghcr.io/barisyazici/franka-sim:1.1.3`, which is what
+the workflow's `tag: latest` resolves to; all 19 pass. On 1.1.2 five fail:
+
+- `test_joint_impedance_motion`, `test_cartesian_impedance_motion`,
+  `test_cartesian_impedance_nullspace_posture`: the `StopMove` that ends an
+  asynchronous impedance motion must make the interrupted Move reply
+  `kPreempted`, which libfranka turns into the `ControlException` a stopped
+  motion raises. 1.1.2 replied `kSuccess`, which falls through to
+  `ProtocolException: Unexpected reply to a Move command`.
+- `test_gripper_grasp_success`, `test_gripper_grasp_failure`: libfranka calls a
+  grasp successful when the final width lands within the epsilon band around
+  the *requested* width. 1.1.2 used a stall heuristic instead, so with nothing
+  between the fingers `grasp(0.04, …, epsilon 0.02)` reported failure and
+  `grasp(0.09, …, epsilon 0.005)` reported success, each the opposite of a
+  real hand.
+
+Both are fixed in 1.1.3. Pin `tag:` in the workflow if you need to hold a
+version; anything below 1.1.3 is red on those five and green on the other 14.
+
+## Motion-limit enforcement
+
+The workflow runs one lane with the sim's default arguments: limit violations
+are logged, nothing aborts. With `--enforce-motion-limits` 17 of 19 pass and two
+fail deterministically: `test_simple_torque_motion` and
+`test_simple_torque_motion_initial_torque` apply ±2 Nm to joint 1 for 1 s,
+which drives it past the FR3's joint velocity limit, and the sim aborts with
+`joint_velocity_violation` the way Control does. A real FR3 would reflex there
+too — the test is written for a simulator that does not enforce limits. To add
+an enforcement lane, deselect those two (the third `simple_torque_motion` test,
+the watchdog one, passes):
+
+```bash
+examples/franky/run-local.sh --start-sim --args '--enforce-motion-limits' \
+  -k 'not (simple_torque_motion and not signal_timeout)'
+```
+
+17 selected, 17 passed, 42 s, and the sim log has no abort in it — the reset
+moves the stand-in makes are within limits too.
+
+`--enforce-comm-constraints` is not worth a lane on a hosted runner: without an
+RT kernel it measures the runner's jitter, not franky.
 
 ## Protocol and versions
 
@@ -93,68 +162,76 @@ franky publishes wheels built against several libfranka versions on its
 [releases page](https://github.com/TimSchneider42/franky/releases), because the
 version has to match the robot's firmware. franka-sim serves v10, so pick a
 wheel built against libfranka ≥ 0.20 — which is what plain
-`pip install franky-control` gives you. franky exposes no version accessor of
-its own, so `smoke.py` prints the distribution version instead.
+`pip install franky-control` gives you.
+
+The test file is fetched from the franky tag `v$FRANKY_VERSION`
+(`v2.0.0` → commit `e7e63c7`), so the tests always match the wheel under test.
+Nothing from franky is vendored here.
 
 ## The RT-kernel gotcha
 
-The one line that is not the upstream quick-start:
+The tests construct
 
 ```python
-Robot(host, realtime_config=RealtimeConfig.Ignore)
+franky.Robot(hostname, realtime_config=franky.RealtimeConfig.Ignore, relative_dynamics_factor=0.2)
 ```
 
 franky defaults to `RealtimeConfig.Enforce` and refuses to construct a `Robot`
 if it cannot get `SCHED_FIFO`. GitHub-hosted runners have no `PREEMPT_RT`
 kernel and no realtime priority, and neither does a typical dev box. The sim
-does not need one — it is not driving motors — so `Ignore` is correct here. On
-a real FR3, leave the default.
+does not need one — it is not driving motors — so `Ignore` is correct here,
+and upstream already writes it that way.
 
 ## Running it locally
 
 ```bash
 examples/franky/run-local.sh --start-sim
-examples/franky/run-local.sh --start-sim --args '--enforce-motion-limits' --reflex
+examples/franky/run-local.sh --start-sim -k gripper
+examples/franky/run-local.sh -- --timeout=60      # anything after -- goes to pytest
 ```
 
 The script creates `.validate/franky-venv` (reusing it if the pinned
-`franky-control` is already installed), starts the sim, waits for
-`franka-sim-check` the way the action does, runs the scripts, and on exit writes
+`franky-control`, `pytest` and `pytest-timeout` are already installed), fetches
+the test file into `.validate/franky-tests/` and prints the tag's commit and the
+file's sha256, starts the sim, waits for `franka-sim-check` the way the action
+does, runs `run-tests.sh` exactly as the workflow does, and on exit writes
 `docker logs` to `.validate/franky-sim.log` before removing the container. The
 pinned version comes from `FRANKY_VERSION` in the workflow, so there is one
-source of truth.
+source of truth. Without `--start-sim` it assumes a sim is already serving
+`127.0.0.1:1337`.
 
 ```bash
 VENV=/somewhere/else                            # virtualenv directory
-FRANKA_SIM_IMAGE=ghcr.io/barisyazici/franka-sim:1.1.2
+FRANKA_SIM_IMAGE=franka-sim:dev                 # a locally built sim instead of :latest
 FRANKY_VERSION=2.0.0                            # override the workflow's pin
 ```
 
-Expected output, `motion-limits` lane:
+Expected output:
 
 ```
-=== smoke.py ===
-franky-control 2.0.0
-connected: mode = RobotMode.Idle q = [-0.0, -0.0, 0.0, -1.57, -0.0, 1.57, 0.785]
-joint move: joint1 = 0.2006 (target 0.2000, err 0.0006 rad)
-cartesian move: |d| = 0.0502 m (target 0.0500), dz = +0.0502 m
-gripper: width = 0.0200 m after move(0.02)
-SMOKE OK
-=== smoke.py: 0m02s ===
+=== fetch franky's integration tests ===
+franky tag: v2.0.0
+e7e63c7c7118f427ad33211500b33b81b4011bb4	refs/tags/v2.0.0
+ad5853f4...  .validate/franky-tests/test_integration_franky_sim.py
+19 tests
+...
+=== franky integration tests ===
+19 tests selected
+.validate/franky-tests/test_integration_franky_sim.py::test_joint_position_control PASSED [100%]
+============================== 1 passed in 5.26s ===============================
+...
+.validate/franky-tests/test_integration_franky_sim.py::test_motion_reuse_raises PASSED [100%]
+============================== 1 passed in 1.99s ===============================
 
-=== reflex.py ===
-normal move: ok, joint1 = -0.0013
-reflex: libfranka: Move command aborted: motion aborted by reflex! ["joint_velocity_violation", "joint_motion_generator_velocity_limits_violation"]
-aborted at joint1 = 2.7060 rad (limit 2.7437)
-after recovery: back home, joint1 = -0.0012 (err 0.0006 rad)
-REFLEX OK
-=== reflex.py: 0m14s ===
+19 tests: 19 passed, 0 failed, in 58s
+=== franky integration tests: 0m58s ===
+total: 1m01s (exit 0)
 ```
 
-Wall time on a 12-core box with a warm venv and image: 3 s for the `nominal`
-lane, 17 s for `motion-limits` — 14 s of which is the provoked motion driving
-joint 1 across its whole range at `relative_dynamics_factor = 0.2`. On a hosted
-runner add ~20 s for the wheel and ~10 s for the sim to come up.
+About a minute on a 12-core box with a warm venv and image — the longest
+single tests are the null-space posture test (7 s) and the two 5–6 s torque
+tests; on a hosted runner add ~20 s for the wheel and ~10 s for the sim to come
+up.
 
 ## Upgrading
 
@@ -164,5 +241,7 @@ One line, in the workflow:
 pip index versions franky-control
 ```
 
-and put it in `FRANKY_VERSION`. `run-local.sh` reads it from there. Check that
-the new wheel still bundles libfranka ≥ 0.20.
+and put it in `FRANKY_VERSION`. `run-local.sh` reads it from there, and both
+fetch the tests from the matching `v…` tag. Check that the new wheel still
+bundles libfranka ≥ 0.20 and that the tag exists — franky tags releases
+`vX.Y.Z`.

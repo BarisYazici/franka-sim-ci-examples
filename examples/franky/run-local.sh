@@ -2,11 +2,17 @@
 #
 # Run .github/workflows/franky.yml on a dev box.
 #
-#   examples/franky/run-local.sh [--start-sim] [--args '...'] [--reflex]
+#   examples/franky/run-local.sh [--start-sim] [--args '...'] [-k EXPR] [-- PYTEST_ARGS...]
 #
 # The venv is $VENV (default <repo>/.validate/franky-venv, gitignored) and is
-# reused if it already has the pinned franky-control. Without --start-sim the
-# script assumes a franka-sim already serving the FCI on 127.0.0.1:1337.
+# reused if it already has the pinned franky-control, pytest and
+# pytest-timeout. The test file is fetched from the franky tag matching that
+# pin into <repo>/.validate/franky-tests/ (gitignored) on every run, exactly as
+# the workflow does. Without --start-sim the script assumes a franka-sim
+# already serving the FCI on 127.0.0.1:1337 and the gripper on 1338.
+#
+#   -k EXPR         pytest -k: run only the tests whose names match EXPR
+#   -- ARGS...      anything after -- is appended to the pytest command line
 #
 # Environment:
 #   VENV               virtualenv directory
@@ -21,20 +27,24 @@ HERE="$REPO_ROOT/examples/franky"
 
 VENV="${VENV:-$REPO_ROOT/.validate/franky-venv}"
 FRANKA_SIM_IMAGE="${FRANKA_SIM_IMAGE:-ghcr.io/barisyazici/franka-sim:latest}"
+FRANKY_REPO=https://github.com/TimSchneider42/franky
+TESTS_DIR="$REPO_ROOT/.validate/franky-tests"
+TEST_FILE="$TESTS_DIR/test_integration_franky_sim.py"
 SIM_CONTAINER=franka-sim
 SIM_LOG="$REPO_ROOT/.validate/franky-sim.log"
 SIM_WAIT=90
 ROBOT_IP=127.0.0.1
 
 START_SIM=0
-RUN_REFLEX=0
 SIM_ARGS=""
+PYTEST_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --start-sim) START_SIM=1 ;;
-    --reflex) RUN_REFLEX=1 ;;
     --args) SIM_ARGS="${2:-}"; shift ;;
-    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -k) PYTEST_ARGS+=(-k "${2:-}"); shift ;;
+    --) shift; PYTEST_ARGS+=("$@"); break ;;
+    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -49,6 +59,7 @@ if [ -z "$FRANKY_VERSION" ]; then
   echo "could not read FRANKY_VERSION from $WORKFLOW" >&2
   exit 1
 fi
+FRANKY_TAG="v$FRANKY_VERSION"
 
 TOTAL_START=$SECONDS
 hms() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
@@ -70,11 +81,11 @@ on_exit() {
 }
 
 echo "venv:      $VENV"
-echo "franky:    franky-control==$FRANKY_VERSION"
+echo "franky:    franky-control==$FRANKY_VERSION (tests from tag $FRANKY_TAG)"
 echo "sim image: $FRANKA_SIM_IMAGE"
 echo "sim args:  ${SIM_ARGS:-<none>}"
 
-mkdir -p "$(dirname "$SIM_LOG")"
+mkdir -p "$(dirname "$SIM_LOG")" "$TESTS_DIR"
 trap on_exit EXIT
 
 # --- 1. the venv -------------------------------------------------------------
@@ -84,15 +95,27 @@ step "python environment"
 if ! "$VENV/bin/python" -c "
 import sys
 from importlib.metadata import version
+import pytest, pytest_timeout
 sys.exit(0 if version('franky-control') == '$FRANKY_VERSION' else 1)
 " 2>/dev/null; then
   "$VENV/bin/pip" install --quiet --upgrade pip
-  "$VENV/bin/pip" install --quiet "franky-control==$FRANKY_VERSION"
+  "$VENV/bin/pip" install --quiet "franky-control==$FRANKY_VERSION" pytest pytest-timeout
 fi
 "$VENV/bin/python" -c "import franky; print('franky import ok')"
 step_done
 
-# --- 2. simulated robot ------------------------------------------------------
+# --- 2. franky's tests -------------------------------------------------------
+
+step "fetch franky's integration tests"
+echo "franky tag: $FRANKY_TAG"
+git ls-remote --tags "$FRANKY_REPO.git" "refs/tags/$FRANKY_TAG"
+curl -fsSL -o "$TEST_FILE" \
+  "https://raw.githubusercontent.com/TimSchneider42/franky/$FRANKY_TAG/tests/pytest/test_integration_franky_sim.py"
+sha256sum "$TEST_FILE"
+echo "$(grep -c '^def test_' "$TEST_FILE") tests"
+step_done
+
+# --- 3. simulated robot ------------------------------------------------------
 
 if [ "$START_SIM" = 1 ]; then
   step "start franka-sim"
@@ -121,14 +144,11 @@ else
   echo "assuming a franka-sim already on $ROBOT_IP:1337 (pass --start-sim to run one)"
 fi
 
-# --- 3. the examples ---------------------------------------------------------
+# --- 4. pytest ---------------------------------------------------------------
 
-step "smoke.py"
-timeout 120 "$VENV/bin/python" "$HERE/smoke.py" --host "$ROBOT_IP"
+# The same script the workflow runs: one pytest process per test, the
+# franky_sim stand-in on PYTHONPATH.
+step "franky integration tests"
+PYTHON="$VENV/bin/python" FRANKA_SIM_HOST="$ROBOT_IP" \
+  "$HERE/run-tests.sh" "$TEST_FILE" ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}
 step_done
-
-if [ "$RUN_REFLEX" = 1 ]; then
-  step "reflex.py"
-  timeout 120 "$VENV/bin/python" "$HERE/reflex.py" --host "$ROBOT_IP"
-  step_done
-fi
