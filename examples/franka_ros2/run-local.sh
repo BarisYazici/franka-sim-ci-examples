@@ -117,7 +117,7 @@ if [ "$START_SIM" = 1 ]; then
   docker rm -f "$SIM_CONTAINER" >/dev/null 2>&1 || true
   # Host networking: the FCI is a 1 kHz UDP loop, and published ports would put
   # Docker's NAT in the middle of it.
-  docker run -d --rm --network host --name "$SIM_CONTAINER" "$FRANKA_SIM_IMAGE" >/dev/null
+  docker run -d --network host --name "$SIM_CONTAINER" "$FRANKA_SIM_IMAGE" >/dev/null
   deadline=$((SECONDS + SIM_WAIT))
   # franka-sim-check does a real Connect handshake and waits for a RobotState
   # datagram, so a pass means the FCI is genuinely being served.
